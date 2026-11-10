@@ -147,6 +147,9 @@ class DeiTPreTrainedModel(ViTPreTrainedModel):
 class DeiTModel(ViTModel):
     pass
 
+    def adapt_input_channels(self, new_num_channels: int, mode: str = "luminance"):
+        raise AttributeError("Channel adaptation is only supported by ViT.")
+
 
 class DeiTForMaskedImageModeling(ViTForMaskedImageModeling):
     @can_return_tuple
@@ -227,9 +230,15 @@ class DeiTForMaskedImageModeling(ViTForMaskedImageModeling):
             attentions=outputs.attentions,
         )
 
+    def adapt_input_channels(self, new_num_channels: int, mode: str = "luminance"):
+        raise AttributeError("Channel adaptation is only supported by ViT.")
+
 
 class DeiTForImageClassification(ViTForImageClassification):
     pass
+
+    def adapt_input_channels(self, new_num_channels: int, mode: str = "luminance"):
+        raise AttributeError("Channel adaptation is only supported by ViT.")
 
 
 @auto_docstring(

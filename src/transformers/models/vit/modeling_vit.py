@@ -39,6 +39,64 @@ from .configuration_vit import ViTConfig
 logger = logging.get_logger(__name__)
 
 
+@torch.no_grad()
+def _adapt_input_conv(projection: nn.Conv2d, new_num_channels: int, mode: str) -> nn.Conv2d:
+    if isinstance(new_num_channels, bool) or not isinstance(new_num_channels, int):
+        raise TypeError(f"`new_num_channels` must be an integer, got {type(new_num_channels).__name__}.")
+    if new_num_channels <= 0:
+        raise ValueError(f"`new_num_channels` must be a positive integer, got {new_num_channels}.")
+    if mode not in ("luminance", "variance", "constant"):
+        raise ValueError(f"Unsupported adaptation mode '{mode}'. Choose from 'luminance', 'variance', or 'constant'.")
+    if projection.in_channels == new_num_channels:
+        return projection
+
+    # Accumulate in float32 for half-precision checkpoints, retaining float64 when requested.
+    weight = projection.weight.detach()
+    weight = weight.to(torch.float64 if weight.dtype == torch.float64 else torch.float32)
+    old_num_channels = projection.in_channels
+    repeat = math.ceil(new_num_channels / old_num_channels)
+    tiled = weight.repeat(1, repeat, 1, 1)[:, :new_num_channels]
+    if mode == "luminance":
+        if new_num_channels == 1:
+            new_weight = weight.sum(dim=1, keepdim=True)
+        else:
+            scaled = tiled * (old_num_channels / new_num_channels)
+            new_weight = (
+                scaled + (weight.sum(dim=1, keepdim=True) - scaled.sum(dim=1, keepdim=True)) / new_num_channels
+            )
+    elif mode == "variance":
+        new_weight = weight.sum(dim=1, keepdim=True) if new_num_channels == 1 else tiled
+        old_energy = weight.square().sum()
+        new_energy = new_weight.square().sum()
+        if new_energy > 0:
+            new_weight = new_weight * (old_energy / new_energy).sqrt()
+        elif old_energy > 0:
+            raise ValueError("Cannot preserve weight energy because the adapted filters have zero energy.")
+    else:
+        new_weight = tiled
+
+    new_projection = nn.Conv2d(
+        new_num_channels,
+        projection.out_channels,
+        kernel_size=projection.kernel_size,
+        stride=projection.stride,
+        padding=projection.padding,
+        dilation=projection.dilation,
+        groups=projection.groups,
+        bias=projection.bias is not None,
+        padding_mode=projection.padding_mode,
+        device=projection.weight.device,
+        dtype=projection.weight.dtype,
+    )
+    new_projection.weight.copy_(new_weight)
+    new_projection.weight.requires_grad_(projection.weight.requires_grad)
+    if projection.bias is not None:
+        new_projection.bias.copy_(projection.bias)
+        new_projection.bias.requires_grad_(projection.bias.requires_grad)
+    new_projection.train(projection.training)
+    return new_projection
+
+
 class ViTPatchEmbeddings(nn.Module):
     """
     This class turns `pixel_values` of shape `(batch_size, num_channels, height, width)` into the initial
@@ -350,6 +408,32 @@ class ViTModel(ViTPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+    def adapt_input_channels(self, new_num_channels: int, mode: str = "luminance") -> nn.Conv2d:
+        """
+        Replace the patch projection to accept a different number of input channels, reusing its weights.
+        Updates `config.num_channels`. Call this before creating an optimizer because the parameters are replaced.
+
+        Args:
+            new_num_channels (`int`):
+                Positive number of input channels.
+            mode (`str`, *optional*, defaults to `"luminance"`):
+                `"luminance"` cyclically repeats filters and corrects their sum to preserve the response when all input
+                bands contain the same image. `"variance"` normalizes the repeated filters to preserve total squared
+                weight norm, and hence the sum of output variances for independent, equal-variance input elements.
+                For one channel it uses the sum of the old filters before normalization. It raises `ValueError` if
+                the adapted filters have zero energy while the old filters do not. `"constant"` cyclically repeats
+                filters without scaling. Half-precision weights are adapted in float32 and cast back afterwards.
+
+        Returns:
+            `torch.nn.Conv2d`: The projection layer. Returns the existing layer if the channel count is unchanged.
+        """
+        patch_embeddings = self.embeddings.patch_embeddings
+        new_projection = _adapt_input_conv(patch_embeddings.projection, new_num_channels, mode)
+        patch_embeddings.projection = new_projection
+        patch_embeddings.num_channels = new_num_channels
+        self.config.num_channels = new_num_channels
+        return new_projection
+
     @merge_with_config_defaults
     @capture_outputs(tie_last_hidden_states=False)
     @auto_docstring
@@ -410,6 +494,71 @@ class ViTForMaskedImageModeling(ViTPreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    @torch.no_grad()
+    def adapt_input_channels(self, new_num_channels: int, mode: str = "luminance") -> nn.Conv2d:
+        """
+        Adapt the input projection as described in [`ViTModel.adapt_input_channels`] and resize the reconstruction
+        decoder. Decoder output bands are repeated cyclically, or averaged when reducing to one band. `mode` only
+        controls the input projection. Call this before creating an optimizer.
+
+        Args:
+            new_num_channels (`int`):
+                Positive number of input and reconstruction channels.
+            mode (`str`, *optional*, defaults to `"luminance"`):
+                Input projection adaptation strategy: `"luminance"`, `"variance"`, or `"constant"`.
+
+        Returns:
+            `torch.nn.Conv2d`: The input projection layer, or the existing layer if the count is unchanged.
+        """
+        patch_embeddings = self.vit.embeddings.patch_embeddings
+        old_num_channels = patch_embeddings.num_channels
+        new_projection = _adapt_input_conv(patch_embeddings.projection, new_num_channels, mode)
+        if new_projection is patch_embeddings.projection:
+            return new_projection
+
+        old_decoder = self.decoder[0]
+        block_size = self.config.encoder_stride**2
+        weight = old_decoder.weight.detach().reshape(old_num_channels, block_size, *old_decoder.weight.shape[1:])
+        bias = (
+            old_decoder.bias.detach().reshape(old_num_channels, block_size) if old_decoder.bias is not None else None
+        )
+        if new_num_channels == 1:
+            accumulation_dtype = torch.float64 if weight.dtype == torch.float64 else torch.float32
+            weight = weight.to(accumulation_dtype).mean(dim=0, keepdim=True)
+            if bias is not None:
+                bias = bias.to(accumulation_dtype).mean(dim=0, keepdim=True)
+        else:
+            indices = torch.arange(new_num_channels, device=weight.device) % old_num_channels
+            weight = weight[indices]
+            if bias is not None:
+                bias = bias[indices]
+        new_decoder = nn.Conv2d(
+            old_decoder.in_channels,
+            new_num_channels * block_size,
+            kernel_size=old_decoder.kernel_size,
+            stride=old_decoder.stride,
+            padding=old_decoder.padding,
+            dilation=old_decoder.dilation,
+            groups=old_decoder.groups,
+            bias=old_decoder.bias is not None,
+            padding_mode=old_decoder.padding_mode,
+            device=old_decoder.weight.device,
+            dtype=old_decoder.weight.dtype,
+        )
+        new_decoder.weight.copy_(weight.flatten(0, 1))
+        new_decoder.weight.requires_grad_(old_decoder.weight.requires_grad)
+        if bias is not None:
+            new_decoder.bias.copy_(bias.flatten())
+            new_decoder.bias.requires_grad_(old_decoder.bias.requires_grad)
+        new_decoder.train(old_decoder.training)
+
+        patch_embeddings.projection = new_projection
+        patch_embeddings.num_channels = new_num_channels
+        self.config.num_channels = new_num_channels
+        self.vit.config.num_channels = new_num_channels
+        self.decoder[0] = new_decoder
+        return new_projection
 
     @can_return_tuple
     @auto_docstring
@@ -524,6 +673,24 @@ class ViTForImageClassification(ViTPreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    def adapt_input_channels(self, new_num_channels: int, mode: str = "luminance") -> nn.Conv2d:
+        """
+        Adapt the input projection as described in [`ViTModel.adapt_input_channels`]. Call this before creating an
+        optimizer because the projection parameters are replaced.
+
+        Args:
+            new_num_channels (`int`):
+                Positive number of input channels.
+            mode (`str`, *optional*, defaults to `"luminance"`):
+                Input projection adaptation strategy: `"luminance"`, `"variance"`, or `"constant"`.
+
+        Returns:
+            `torch.nn.Conv2d`: The input projection layer, or the existing layer if the count is unchanged.
+        """
+        new_projection = self.vit.adapt_input_channels(new_num_channels, mode=mode)
+        self.config.num_channels = new_num_channels
+        return new_projection
 
     @can_return_tuple
     @auto_docstring

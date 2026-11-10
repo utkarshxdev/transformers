@@ -91,6 +91,28 @@ print(f"The predicted class label is: {predicted_class_label}")
 - Use [`ViTImageProcessor`] to resize (or rescale) and normalize images to the expected size.
 - The patch and image resolution are reflected in the checkpoint name. For example, google/vit-base-patch16-224, is the **base-sized** architecture with a patch resolution of 16x16 and fine-tuning resolution of 224x224.
 
+## Adapt the number of input channels
+
+Load the original checkpoint first, then call `adapt_input_channels` to reuse its patch projection weights for a
+different number of bands. Call it before creating an optimizer, because it replaces the projection parameters.
+
+```python
+from transformers import ViTForImageClassification
+
+model = ViTForImageClassification.from_pretrained("google/vit-base-patch16-224")
+model.adapt_input_channels(4)
+```
+
+The default `mode="luminance"` repeats filters cyclically and corrects their sum, preserving the projection's response
+when every input band contains the same image. `mode="variance"` preserves total squared weight norm, which preserves
+the sum of output variances for independent, equal-variance input elements. It does not preserve the response to
+correlated bands. `mode="constant"` repeats filters without scaling.
+
+Prepare tensors with shape `(batch_size, num_channels, height, width)` and normalize each band appropriately. This
+method updates the model configuration but does not update an image processor's RGB normalization settings.
+For [`ViTForMaskedImageModeling`], it also resizes the reconstruction decoder: output bands are repeated cyclically,
+or averaged when reducing to one channel. Adapted models can be saved with `save_pretrained` and reloaded normally.
+
 ## ViTConfig
 
 [[autodoc]] ViTConfig
@@ -110,13 +132,16 @@ print(f"The predicted class label is: {predicted_class_label}")
 
 [[autodoc]] ViTModel
     - forward
+    - adapt_input_channels
 
 ## ViTForMaskedImageModeling
 
 [[autodoc]] ViTForMaskedImageModeling
     - forward
+    - adapt_input_channels
 
 ## ViTForImageClassification
 
 [[autodoc]] ViTForImageClassification
     - forward
+    - adapt_input_channels

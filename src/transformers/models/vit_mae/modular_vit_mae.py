@@ -489,6 +489,9 @@ class ViTMAEModel(ViTModel):
 
         return ViTMAEModelOutput(last_hidden_state=sequence_output, mask=mask, ids_restore=ids_restore)
 
+    def adapt_input_channels(self, new_num_channels: int, mode: str = "luminance"):
+        raise AttributeError("Channel adaptation is only supported by ViT.")
+
 
 @auto_docstring(
     custom_intro="""

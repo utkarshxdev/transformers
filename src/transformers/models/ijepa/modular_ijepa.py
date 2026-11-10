@@ -117,6 +117,9 @@ class IJepaModel(IJepaPreTrainedModel, ViTModel):
         self.config = config
         self.embeddings = IJepaEmbeddings(config, use_mask_token=use_mask_token)
 
+    def adapt_input_channels(self, new_num_channels: int, mode: str = "luminance"):
+        raise AttributeError("Channel adaptation is only supported by ViT.")
+
 
 @auto_docstring(
     custom_intro="""
@@ -163,6 +166,9 @@ class IJepaForImageClassification(IJepaPreTrainedModel, ViTForImageClassificatio
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+    def adapt_input_channels(self, new_num_channels: int, mode: str = "luminance"):
+        raise AttributeError("Channel adaptation is only supported by ViT.")
 
 
 __all__ = [

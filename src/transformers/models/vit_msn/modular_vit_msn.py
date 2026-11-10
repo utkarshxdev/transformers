@@ -142,6 +142,9 @@ class ViTMSNModel(ViTModel):
 
         return BaseModelOutput(last_hidden_state=sequence_output)
 
+    def adapt_input_channels(self, new_num_channels: int, mode: str = "luminance"):
+        raise AttributeError("Channel adaptation is only supported by ViT.")
+
 
 @auto_docstring
 class ViTMSNForImageClassification(ViTMSNPreTrainedModel):

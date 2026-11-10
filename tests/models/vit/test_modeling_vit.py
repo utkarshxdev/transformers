@@ -13,6 +13,8 @@
 # limitations under the License.
 """Testing suite for the PyTorch ViT model."""
 
+import copy
+import tempfile
 import unittest
 from functools import cached_property
 
@@ -236,6 +238,181 @@ class ViTModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCase):
     def test_for_image_classification(self):
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
         self.model_tester.create_and_check_for_image_classification(*config_and_inputs)
+
+    def test_adapt_input_channels(self):
+        config = self.model_tester.get_config()
+
+        for model_class in self.all_model_classes:
+            model = model_class(copy.deepcopy(config)).to(torch_device)
+            model.eval()
+            base_model = getattr(model, model.base_model_prefix, model)
+            for channels, mode in ((4, "luminance"), (12, "variance"), (1, "luminance")):
+                with self.subTest(model=model_class.__name__, channels=channels):
+                    projection = model.adapt_input_channels(channels, mode=mode)
+                    self.assertIs(projection, base_model.embeddings.patch_embeddings.projection)
+                    self.assertEqual(model.config.num_channels, channels)
+                    self.assertEqual(base_model.config.num_channels, channels)
+                    self.assertEqual(base_model.embeddings.patch_embeddings.num_channels, channels)
+                    inputs = torch.randn(2, channels, config.image_size, config.image_size, device=torch_device)
+                    self.assertIsNotNone(model(inputs))
+                    self.assertIs(model.adapt_input_channels(channels), projection)
+
+            model.train()
+            model.adapt_input_channels(4)
+            inputs = torch.randn(2, 4, config.image_size, config.image_size, device=torch_device)
+            outputs = model(inputs)
+            out_tensor = outputs[0]
+            loss = (out_tensor * torch.randn_like(out_tensor)).sum()
+            loss.backward()
+            weight_grad = base_model.embeddings.patch_embeddings.projection.weight.grad
+            self.assertIsNotNone(weight_grad)
+            self.assertTrue(torch.isfinite(weight_grad).all())
+            per_ch = weight_grad.abs().amax(dim=(0, 2, 3))
+            self.assertTrue(per_ch.max() > 0)
+            self.assertTrue((per_ch > 1e-3 * per_ch.max()).all())
+
+    def test_adapt_input_channels_validation(self):
+        model = ViTModel(self.model_tester.get_config())
+        projection = model.embeddings.patch_embeddings.projection
+        for channels, error in ((0, ValueError), (-3, ValueError), (True, TypeError), (2.5, TypeError)):
+            with self.subTest(channels=channels), self.assertRaises(error):
+                model.adapt_input_channels(channels)
+        for channels in (1, model.config.num_channels, 4):
+            with self.subTest(channels=channels), self.assertRaises(ValueError):
+                model.adapt_input_channels(channels, mode="invalid_mode")
+        self.assertIs(model.embeddings.patch_embeddings.projection, projection)
+        self.assertEqual(model.config.num_channels, self.model_tester.num_channels)
+
+    def test_adapt_input_channels_preserves_projection_attributes(self):
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                model = ViTModel(self.model_tester.get_config()).to(device=torch_device, dtype=dtype).eval()
+                old = model.embeddings.patch_embeddings.projection
+                old.weight.requires_grad_(False)
+                old.bias.requires_grad_(True)
+                with torch.no_grad():
+                    old.bias.fill_(0.25)
+                projection = model.adapt_input_channels(4)
+                self.assertEqual(projection.weight.dtype, dtype)
+                self.assertEqual(projection.weight.device, old.weight.device)
+                self.assertFalse(projection.weight.requires_grad)
+                self.assertTrue(projection.bias.requires_grad)
+                self.assertFalse(projection.training)
+                torch.testing.assert_close(projection.bias, old.bias, rtol=0, atol=0)
+                for name in ("stride", "padding", "dilation", "groups", "padding_mode"):
+                    self.assertEqual(getattr(projection, name), getattr(old, name))
+
+        model = ViTModel(self.model_tester.get_config())
+        model.embeddings.patch_embeddings.projection.bias = None
+        self.assertIsNone(model.adapt_input_channels(4).bias)
+
+    def test_adapt_input_channels_constant(self):
+        config = self.model_tester.get_config()
+        model = ViTModel(copy.deepcopy(config))
+        weight = model.embeddings.patch_embeddings.projection.weight.detach().clone()
+        for channels in (1, 2, 4, 12):
+            with self.subTest(channels=channels):
+                adapted = ViTModel(copy.deepcopy(config))
+                adapted.load_state_dict(model.state_dict())
+                projection = adapted.adapt_input_channels(channels, mode="constant")
+                expected = weight[:, torch.arange(channels) % config.num_channels]
+                torch.testing.assert_close(projection.weight, expected, rtol=0, atol=0)
+
+    def test_adapt_input_channels_energy_conservation(self):
+        config = self.model_tester.get_config()
+        model = ViTModel(copy.deepcopy(config))
+        with torch.no_grad():
+            model.embeddings.patch_embeddings.projection.weight.mul_(torch.tensor([1.5, 0.8, 0.3]).view(1, 3, 1, 1))
+        for dtype, tolerance in ((torch.float32, 1e-5), (torch.float16, 2e-3), (torch.bfloat16, 2e-2)):
+            for channels in (1, 2, 4, 12, 128):
+                with self.subTest(dtype=dtype, channels=channels):
+                    adapted = ViTModel(copy.deepcopy(config)).to(dtype)
+                    adapted.load_state_dict(model.state_dict())
+                    old_energy = adapted.embeddings.patch_embeddings.projection.weight.detach().float().square().sum()
+                    projection = adapted.adapt_input_channels(channels, mode="variance")
+                    energy = projection.weight.detach().float().square().sum()
+                    self.assertTrue(torch.isfinite(energy))
+                    torch.testing.assert_close(energy / old_energy, torch.ones_like(energy), rtol=tolerance, atol=0)
+
+        model = ViTModel(copy.deepcopy(config)).half()
+        with torch.no_grad():
+            model.embeddings.patch_embeddings.projection.weight.fill_(1.0)
+        old_energy = model.embeddings.patch_embeddings.projection.weight.detach().float().square().sum()
+        projection = model.adapt_input_channels(1024, mode="variance")
+        energy = projection.weight.detach().float().square().sum()
+        torch.testing.assert_close(energy / old_energy, torch.ones_like(energy), rtol=2e-3, atol=0)
+
+    def test_adapt_input_channels_luminance_equivalence(self):
+        config = self.model_tester.get_config()
+        gray = torch.randn(2, 1, config.image_size, config.image_size)
+        for old_channels in (1, 3, 4, 12):
+            config.num_channels = old_channels
+            model = ViTModel(copy.deepcopy(config))
+            with torch.no_grad():
+                model.embeddings.patch_embeddings.projection.bias.fill_(0.25)
+                expected = model.embeddings.patch_embeddings(gray.expand(-1, old_channels, -1, -1))
+            for channels in (1, 2, 4, 12, 128):
+                with self.subTest(old_channels=old_channels, channels=channels):
+                    adapted = ViTModel(copy.deepcopy(config))
+                    adapted.load_state_dict(model.state_dict())
+                    adapted.adapt_input_channels(channels)
+                    with torch.no_grad():
+                        actual = adapted.embeddings.patch_embeddings(gray.expand(-1, channels, -1, -1))
+                    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+    def test_adapt_input_channels_masked_image_modeling(self):
+        config = self.model_tester.get_config()
+        model = ViTForMaskedImageModeling(config).to(torch_device).eval()
+        old_decoder = model.decoder[0]
+        with torch.no_grad():
+            old_decoder.bias.copy_(torch.arange(old_decoder.out_channels, device=torch_device))
+        stride_squared = config.encoder_stride**2
+        expected_weight = old_decoder.weight.detach().reshape(
+            config.num_channels, stride_squared, config.hidden_size, 1, 1
+        )
+        expected_bias = old_decoder.bias.detach().reshape(config.num_channels, stride_squared)
+        model.adapt_input_channels(4)
+        decoder = model.decoder[0]
+        self.assertFalse(decoder.training)
+        torch.testing.assert_close(decoder.weight[: old_decoder.out_channels], old_decoder.weight, rtol=0, atol=0)
+        torch.testing.assert_close(decoder.weight[-stride_squared:], expected_weight[0], rtol=0, atol=0)
+        torch.testing.assert_close(decoder.bias[-stride_squared:], expected_bias[0], rtol=0, atol=0)
+        pixels = torch.randn(2, 4, config.image_size, config.image_size, device=torch_device)
+        num_patches = (config.image_size // config.patch_size) ** 2
+        mask = torch.arange(num_patches, device=torch_device).remainder(2).bool().expand(2, -1)
+        outputs = model(pixels, bool_masked_pos=mask)
+        self.assertEqual(outputs.reconstruction.shape, pixels.shape)
+        self.assertTrue(torch.isfinite(outputs.loss))
+        outputs.loss.backward()
+        self.assertTrue(torch.isfinite(decoder.weight.grad).all())
+        self.assertGreater(decoder.weight.grad.abs().sum().item(), 0)
+
+        weight = decoder.weight.detach().reshape(4, stride_squared, config.hidden_size, 1, 1).mean(dim=0)
+        bias = decoder.bias.detach().reshape(4, stride_squared).mean(dim=0)
+        model.adapt_input_channels(1)
+        torch.testing.assert_close(model.decoder[0].weight, weight)
+        torch.testing.assert_close(model.decoder[0].bias, bias)
+
+    def test_adapt_input_channels_save_load_roundtrip(self):
+        config = self.model_tester.get_config()
+        for model_class in self.all_model_classes:
+            for channels in (1, 4):
+                with self.subTest(model=model_class.__name__, channels=channels):
+                    model = model_class(copy.deepcopy(config)).eval()
+                    model.adapt_input_channels(channels)
+                    pixels = torch.randn(2, channels, config.image_size, config.image_size)
+                    with torch.no_grad():
+                        expected = model(pixels)[0]
+                    with tempfile.TemporaryDirectory() as tmp_dir:
+                        model.save_pretrained(tmp_dir)
+                        loaded = model_class.from_pretrained(
+                            tmp_dir, attn_implementation=model.config._attn_implementation
+                        ).eval()
+                    self.assertEqual(loaded.config.num_channels, channels)
+                    for name, value in model.state_dict().items():
+                        torch.testing.assert_close(loaded.state_dict()[name], value, rtol=0, atol=0)
+                    with torch.no_grad():
+                        torch.testing.assert_close(loaded(pixels)[0], expected, rtol=0, atol=0)
 
     @slow
     def test_model_from_pretrained(self):
