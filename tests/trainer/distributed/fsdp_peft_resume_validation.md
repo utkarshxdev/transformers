@@ -104,6 +104,15 @@ TORCH_DISTRIBUTED_DEBUG=INFO \
 This rerun is pending. If it passes, it will support the debug-wrapper diagnosis for
 these failures; if it fails, retain the first worker traceback for each failed job.
 
+The latest supplied retry reports `2 failed, 8 deselected, 2 warnings in 23.42s`.
+Both controllers fail in their prerequisite `save` job. Its traceback identifies a
+different, 97-line Kaggle script with a tail-only `RuntimeError` wrapper, whereas the
+committed harness has 355 lines and records worker exceptions. Both jobs still report
+`error_file: <N/A>` and omit the original worker exception. The output does not record
+the effective distributed debug level. It therefore does not resolve the `INFO`
+diagnostic or establish a new root cause. Restore the committed harness before
+retrying, and retain its checksums and complete logs alongside the test result.
+
 The DeepSpeed control was skipped because DeepSpeed was not installed. ZeRO-3 behavior
 was therefore not GPU-verified by this run.
 
