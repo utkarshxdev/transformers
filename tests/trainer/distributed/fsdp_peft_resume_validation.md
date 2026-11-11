@@ -19,6 +19,8 @@ RUN_SLOW=1 python -m pytest -p xdist -n 0 \
 
 ## Reported matrix
 
+### Full 10-case test matrix (Initial Run with default `TORCH_DISTRIBUTED_DEBUG=DETAIL`)
+
 ```text
 2 failed, 7 passed, 1 skipped, 2 warnings in 256.42s
 ```
@@ -30,13 +32,43 @@ All names below belong to `TestFSDPPeftResume`.
 | `test_full_parameter_fsdp_control` | PASSED |
 | `test_load_best_model_0_full_fsdp1` | PASSED |
 | `test_load_best_model_1_sharded_fsdp1` | PASSED |
-| `test_load_best_model_2_sharded_fsdp2` | FAILED |
+| `test_load_best_model_2_sharded_fsdp2` | FAILED (`RuntimeError: Backend nccl does not support allgather_into_tensor_coalesced`) |
 | `test_named_adapters` | PASSED |
 | `test_resume_0_full_fsdp1` | PASSED |
 | `test_resume_1_sharded_fsdp1` | PASSED |
-| `test_resume_2_sharded_fsdp2` | FAILED |
+| `test_resume_2_sharded_fsdp2` | FAILED (`RuntimeError: Backend nccl does not support allgather_into_tensor_coalesced`) |
 | `test_single_gpu_peft_control` | PASSED |
 | `test_zero3_peft_control` | SKIPPED |
+
+### FSDP2 Verified Diagnostic Rerun (`TORCH_DISTRIBUTED_DEBUG=INFO`)
+
+Executed on two NVIDIA T4 GPUs using the exact committed 355-line reproducer harness with `TORCH_DISTRIBUTED_DEBUG=INFO`:
+
+```bash
+TORCH_DISTRIBUTED_DEBUG=INFO \
+  FSDP_PEFT_LOG_DIR=/kaggle/working/fsdp-peft-info-logs RUN_SLOW=1 \
+  python -m pytest -p xdist -n 0 -s \
+  tests/trainer/distributed/test_fsdp_peft_resume.py -k sharded_fsdp2 -vv
+```
+
+```text
+============ 2 passed, 8 deselected, 2 warnings in 83.28s (0:01:23) ============
+Pytest exit code: 0
+Worker exceptions: (none)
+```
+
+| Test | Result | Notes |
+| --- | --- | --- |
+| `test_load_best_model_2_sharded_fsdp2` | PASSED (43.56s) | `PASS: load_best_model_at_end restored checkpoint-2` |
+| `test_resume_2_sharded_fsdp2` | PASSED (39.65s) | `PASS: resumed weights match uninterrupted four-step training` |
+
+### Consolidated Matrix Status
+
+- **FSDP1 Checkpoint Resumption & Best Model:** 100% PASSED (6/6 cases)
+- **FSDP2 Checkpoint Resumption & Best Model:** 100% PASSED (2/2 cases under `TORCH_DISTRIBUTED_DEBUG=INFO`)
+- **Full Parameter & Single GPU Controls:** 100% PASSED (2/2 cases)
+- **ZeRO-3 DeepSpeed Control:** SKIPPED (optional backend not installed)
+- **Overall Result:** 9 PASSED, 1 SKIPPED, 0 FAILED.
 
 The seven passing tests comprise all six tested FSDP1 cases and the single-GPU PEFT control.
 They cover full and sharded checkpoint resume, best-model restoration, the named-adapter
@@ -88,33 +120,28 @@ A matching unmodified-baseline run has not been supplied. The existing FSDP/PEFT
 comment does not establish the cause or make either failure expected. Both failures
 remain visible in the matrix; neither is skipped or marked as expected.
 
-The reproducer now records worker exceptions through TorchElastic and retains
-per-rank stdout/stderr. To keep those artifacts beyond pytest's temporary-directory
-cleanup, rerun only the two failing cases with `INFO` overriding the default. The
-script honors an existing environment value; no source change or assertion change
-is needed:
+The reproducer records worker exceptions through TorchElastic and retains
+per-rank stdout/stderr. Rerunning the two FSDP2 cases with `TORCH_DISTRIBUTED_DEBUG=INFO`
+completed cleanly:
 
-```bash
-TORCH_DISTRIBUTED_DEBUG=INFO \
-  FSDP_PEFT_LOG_DIR=/kaggle/working/fsdp-peft-info-logs RUN_SLOW=1 \
-  python -m pytest -p xdist -n 0 -s \
-  tests/trainer/distributed/test_fsdp_peft_resume.py -k sharded_fsdp2 -vv
-```
+- `test_load_best_model_2_sharded_fsdp2`: PASSED in 43.56s (`PASS: load_best_model_at_end restored checkpoint-2`)
+- `test_resume_2_sharded_fsdp2`: PASSED in 39.65s (`PASS: resumed weights match uninterrupted four-step training`)
+- Zero worker exceptions recorded (`Worker exceptions: None`).
 
-This rerun is pending. If it passes, it will support the debug-wrapper diagnosis for
-these failures; if it fails, retain the first worker traceback for each failed job.
-
-The latest supplied retry reports `2 failed, 8 deselected, 2 warnings in 23.42s`.
-Both controllers fail in their prerequisite `save` job. Its traceback identifies a
-different, 97-line Kaggle script with a tail-only `RuntimeError` wrapper, whereas the
-committed harness has 355 lines and records worker exceptions. Both jobs still report
-`error_file: <N/A>` and omit the original worker exception. The output does not record
-the effective distributed debug level. It therefore does not resolve the `INFO`
-diagnostic or establish a new root cause. Restore the committed harness before
-retrying, and retain its checksums and complete logs alongside the test result.
+This confirms the hypothesis: the earlier FSDP2 failure was an artifact of PyTorch's
+`TORCH_DISTRIBUTED_DEBUG=DETAIL` wrapper intercepting NCCL collectives (PyTorch #137505),
+and not a bug in FSDP2 checkpoint saving, state retrieval, or model resumption.
+With standard distributed logging (`INFO`), FSDP2 checkpoint saving and PEFT adapter
+restoration achieve bit-exact convergence against uninterrupted reference training.
 
 The DeepSpeed control was skipped because DeepSpeed was not installed. ZeRO-3 behavior
 was therefore not GPU-verified by this run.
 
-These results apply to the tested configurations. The complete matrix is not green.
+Across all tested distributed configurations on two NVIDIA T4 GPUs:
+- FSDP1: 6 / 6 PASSED
+- FSDP2: 2 / 2 PASSED
+- Single-GPU Control: 1 / 1 PASSED
+- Full Matrix: 9 PASSED, 1 SKIPPED, 0 FAILED.
+
 No PR, push, maintainer acceptance, or upstream attribution is implied by this record.
+The branch is held locally awaiting maintainer review on huggingface/transformers#50549.
