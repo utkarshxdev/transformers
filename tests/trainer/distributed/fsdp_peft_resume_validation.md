@@ -64,24 +64,45 @@ phase `save`, while the best-model test's controller failed in phase `best`. Thi
 corrects the earlier summary that both failed during the initial save phase. Phase
 labels identify whole training jobs, not the precise failing operation within a worker.
 
-Both excerpts contain only the launcher-level `ChildFailedError`, with
-`error_file: <N/A>`; the underlying worker exception is missing. The Kaggle launcher's
-tail-only error wrapper also differs from the committed reproducer's complete-log
-reporting. No checkpoint-saving root cause can be established from those excerpts.
-A matching unmodified-baseline run has not been supplied either. The cause could
-involve the harness, configuration, dependencies, or framework behavior. The existing
-FSDP/PEFT TODO comment does not establish the cause or make either failure expected.
-Both failures remain visible in the matrix; neither is skipped or marked as expected.
+The user subsequently supplied the first worker traceback from `save.log`. After
+training completed, the harness called `trainer.accelerator.get_state_dict()` to
+collect validation weights. FSDP2 DTensor redistribution then failed with:
+
+```text
+RuntimeError: Backend nccl does not support allgather_into_tensor_coalesced
+```
+
+This identifies a failure in the harness's post-training snapshot; it does not show
+that Trainer checkpoint saving or optimizer restoration failed. The supplied traceback
+is from the resume scenario's `save` job. The best-model job's worker traceback has
+not been supplied, so the two failures cannot yet be assigned the same cause.
+
+A likely trigger is the harness's default `TORCH_DISTRIBUTED_DEBUG=DETAIL`. PyTorch
+[issue #137505](https://github.com/pytorch/pytorch/issues/137505) reports this exact
+error with that setting and successful runs after removing it. `DETAIL` enables a
+process-group wrapper whose collective support can differ from the underlying NCCL
+backend. This is a hypothesis for the supplied environment until an otherwise
+identical rerun succeeds with `INFO`.
+
+A matching unmodified-baseline run has not been supplied. The existing FSDP/PEFT TODO
+comment does not establish the cause or make either failure expected. Both failures
+remain visible in the matrix; neither is skipped or marked as expected.
 
 The reproducer now records worker exceptions through TorchElastic and retains
 per-rank stdout/stderr. To keep those artifacts beyond pytest's temporary-directory
-cleanup, rerun only the two failing cases with:
+cleanup, rerun only the two failing cases with `INFO` overriding the default. The
+script honors an existing environment value; no source change or assertion change
+is needed:
 
 ```bash
-FSDP_PEFT_LOG_DIR=/kaggle/working/fsdp-peft-logs RUN_SLOW=1 \
+TORCH_DISTRIBUTED_DEBUG=INFO \
+  FSDP_PEFT_LOG_DIR=/kaggle/working/fsdp-peft-info-logs RUN_SLOW=1 \
   python -m pytest -p xdist -n 0 -s \
   tests/trainer/distributed/test_fsdp_peft_resume.py -k sharded_fsdp2 -vv
 ```
+
+This rerun is pending. If it passes, it will support the debug-wrapper diagnosis for
+these failures; if it fails, retain the first worker traceback for each failed job.
 
 The DeepSpeed control was skipped because DeepSpeed was not installed. ZeRO-3 behavior
 was therefore not GPU-verified by this run.
