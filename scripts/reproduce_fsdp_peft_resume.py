@@ -31,6 +31,7 @@ No checkpoint files are fabricated and no distributed functions are patched.
 Failures and watchdog timeouts are preserved in the per-phase log files.
 Set FSDP_PEFT_LOG_DIR to a persistent directory to retain phase logs and per-rank
 torchrun output even when pytest removes its temporary experiment directories.
+TORCH_DISTRIBUTED_DEBUG defaults to INFO; opt into DETAIL explicitly when needed.
 """
 
 import argparse
@@ -302,7 +303,13 @@ def run_worker(args):
         resume = True if args.resume_from_checkpoint == "auto" else str(args.output_dir / "checkpoint-2")
     print(
         json.dumps(
-            {"phase": args.phase, "rank": training_args.process_index, "event": "train_begin", "resume": resume}
+            {
+                "phase": args.phase,
+                "rank": training_args.process_index,
+                "event": "train_begin",
+                "resume": resume,
+                "distributed_debug": str(torch.distributed.get_debug_level()),
+            }
         ),
         flush=True,
     )
@@ -329,7 +336,8 @@ def run_worker(args):
 def main():
     args = parse_args()
     faulthandler.enable()
-    os.environ.setdefault("TORCH_DISTRIBUTED_DEBUG", "DETAIL")
+    # DETAIL's process-group wrapper can fail on FSDP2 DTensor snapshot collectives.
+    os.environ.setdefault("TORCH_DISTRIBUTED_DEBUG", "INFO")
     os.environ.setdefault("NCCL_DEBUG", "INFO")
     os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
     os.environ.setdefault("OMP_NUM_THREADS", "1")
