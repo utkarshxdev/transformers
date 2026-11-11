@@ -59,13 +59,29 @@ for every possible FSDP1 configuration or a performance improvement.
 
 ## Failures and verification limits
 
-The user reports both FSDP2 cases failed during their initial `save` phase. Their detailed
-tracebacks and a matching unmodified-baseline run have not been supplied. The changed
-optimizer-loading path is not reached in that phase, but the underlying cause remains
-unclassified. It could involve the harness, configuration, dependencies, or framework
-behavior. The existing FSDP/PEFT TODO comment does not establish the cause or make either
-failure expected. Both failures remain visible in the matrix; neither is skipped or
-marked as an expected failure.
+The subsequent supplied pytest output shows the resume test's controller failed in
+phase `save`, while the best-model test's controller failed in phase `best`. This
+corrects the earlier summary that both failed during the initial save phase. Phase
+labels identify whole training jobs, not the precise failing operation within a worker.
+
+Both excerpts contain only the launcher-level `ChildFailedError`, with
+`error_file: <N/A>`; the underlying worker exception is missing. The Kaggle launcher's
+tail-only error wrapper also differs from the committed reproducer's complete-log
+reporting. No checkpoint-saving root cause can be established from those excerpts.
+A matching unmodified-baseline run has not been supplied either. The cause could
+involve the harness, configuration, dependencies, or framework behavior. The existing
+FSDP/PEFT TODO comment does not establish the cause or make either failure expected.
+Both failures remain visible in the matrix; neither is skipped or marked as expected.
+
+The reproducer now records worker exceptions through TorchElastic and retains
+per-rank stdout/stderr. To keep those artifacts beyond pytest's temporary-directory
+cleanup, rerun only the two failing cases with:
+
+```bash
+FSDP_PEFT_LOG_DIR=/kaggle/working/fsdp-peft-logs RUN_SLOW=1 \
+  python -m pytest -p xdist -n 0 -s \
+  tests/trainer/distributed/test_fsdp_peft_resume.py -k sharded_fsdp2 -vv
+```
 
 The DeepSpeed control was skipped because DeepSpeed was not installed. ZeRO-3 behavior
 was therefore not GPU-verified by this run.

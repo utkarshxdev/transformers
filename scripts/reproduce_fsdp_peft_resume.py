@@ -29,6 +29,8 @@ CPU; it does not reproduce or verify FSDP/NCCL behavior.
 
 No checkpoint files are fabricated and no distributed functions are patched.
 Failures and watchdog timeouts are preserved in the per-phase log files.
+Set FSDP_PEFT_LOG_DIR to a persistent directory to retain phase logs and per-rank
+torchrun output even when pytest removes its temporary experiment directories.
 """
 
 import argparse
@@ -75,6 +77,11 @@ def parse_args():
 def launch(args, phase, output_dir):
     """Run a real job and kill its entire process group on timeout."""
     output_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = output_dir
+    if os.environ.get("FSDP_PEFT_LOG_DIR"):
+        log_dir = Path(os.environ["FSDP_PEFT_LOG_DIR"]) / args.output_dir.name / output_dir.name
+    log_dir.mkdir(parents=True, exist_ok=True)
+    rank_log_dir = log_dir / f"{phase}-workers"
     cmd = [sys.executable]
     if not args.cpu:
         cmd.extend(
@@ -84,6 +91,8 @@ def launch(args, phase, output_dir):
                 "--standalone",
                 "--local-addr=127.0.0.1",
                 f"--nproc_per_node={args.processes}",
+                f"--log-dir={rank_log_dir}",
+                "--tee=3",
             ]
         )
     cmd.extend(
@@ -112,8 +121,10 @@ def launch(args, phase, output_dir):
     for flag in ("cpu", "no_peft", "extra_adapter"):
         if getattr(args, flag):
             cmd.append("--" + flag.replace("_", "-"))
-    log_file = output_dir / f"{phase}.log"
-    print(json.dumps({"phase": phase, "command": cmd, "log": str(log_file)}), flush=True)
+    log_file = log_dir / f"{phase}.log"
+    print(
+        json.dumps({"phase": phase, "command": cmd, "log": str(log_file), "rank_logs": str(rank_log_dir)}), flush=True
+    )
     with log_file.open("w") as log:
         with subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True) as process:
             try:
@@ -124,6 +135,8 @@ def launch(args, phase, output_dir):
                 raise SystemExit(f"Watchdog expired after {args.timeout}s in {phase}; inspect {log_file}") from None
     if code:
         print(log_file.read_text(), file=sys.stderr)
+        for error_file in sorted(rank_log_dir.rglob("error.json")):
+            print(f"Recorded worker exception: {error_file}", file=sys.stderr)
         raise SystemExit(f"{phase} exited with code {code}; inspect {log_file}")
 
 
@@ -329,9 +342,11 @@ def main():
     if args.phase == "all":
         run_experiment(args)
     else:
+        from torch.distributed.elastic.multiprocessing.errors import record
+
         faulthandler.dump_traceback_later(60, repeat=True)
         try:
-            run_worker(args)
+            record(run_worker)(args)
         finally:
             faulthandler.cancel_dump_traceback_later()
 
