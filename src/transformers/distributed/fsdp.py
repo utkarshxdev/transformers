@@ -264,6 +264,37 @@ def get_fsdp_ckpt_kwargs():
         return {}
 
 
+def load_fsdp_optimizer_state(fsdp_plugin, accelerator, optimizer, model, checkpoint):
+    """Restore FSDP optimizer state, allocating fresh FSDP1 sharded state from checkpoint metadata."""
+    from accelerate.utils import load_fsdp_optimizer
+    from accelerate.utils.constants import OPTIMIZER_NAME
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.distributed.fsdp import StateDictType
+
+    if getattr(fsdp_plugin, "fsdp_version", 1) != 1 or fsdp_plugin.state_dict_type != StateDictType.SHARDED_STATE_DICT:
+        return load_fsdp_optimizer(fsdp_plugin, accelerator, optimizer, model, checkpoint, **get_fsdp_ckpt_kwargs())
+
+    from torch.distributed.checkpoint import FileSystemReader
+    from torch.distributed.checkpoint.optimizer import load_sharded_optimizer_state_dict
+
+    accelerator.wait_for_everyone()
+    with FSDP.state_dict_type(
+        model, fsdp_plugin.state_dict_type, fsdp_plugin.state_dict_config, fsdp_plugin.optim_state_dict_config
+    ):
+        # A fresh optimizer has no state tensors. DCP's regular load only fills existing entries, so using
+        # FSDP.optim_state_dict(model, optimizer) as its template silently leaves the optimizer state empty.
+        # Allocate the saved moments from metadata and use the current model's sharding layout instead.
+        state_dict = load_sharded_optimizer_state_dict(
+            model_state_dict=model.state_dict(),
+            optimizer_key="optimizer",
+            storage_reader=FileSystemReader(os.path.join(checkpoint, f"{OPTIMIZER_NAME}_0")),
+        )
+        optimizer.load_state_dict(
+            FSDP.optim_state_dict_to_load(model=model, optim=optimizer, optim_state_dict=state_dict["optimizer"])
+        )
+    accelerator.wait_for_everyone()
+
+
 def update_fsdp_plugin_peft(model, accelerator):
     """
     Updates the FSDP plugin for PEFT LoRA/QLoRA compatibility.

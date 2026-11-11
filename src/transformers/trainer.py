@@ -56,7 +56,12 @@ from . import __version__
 from .configuration_utils import PreTrainedConfig
 from .data.data_collator import DataCollator, DataCollatorWithPadding, default_data_collator
 from .debug_utils import DebugOption, DebugUnderflowOverflow
-from .distributed.fsdp import get_fsdp_ckpt_kwargs, is_fsdp_managed_module, update_fsdp_plugin_peft
+from .distributed.fsdp import (
+    get_fsdp_ckpt_kwargs,
+    is_fsdp_managed_module,
+    load_fsdp_optimizer_state,
+    update_fsdp_plugin_peft,
+)
 from .feature_extraction_sequence_utils import SequenceFeatureExtractor
 from .feature_extraction_utils import FeatureExtractionMixin
 from .hyperparameter_search import ALL_HYPERPARAMETER_SEARCH_BACKENDS, default_hp_search_backend
@@ -224,7 +229,6 @@ if is_accelerate_available():
         DistributedType,
         GradientAccumulationPlugin,
         load_fsdp_model,
-        load_fsdp_optimizer,
         release_memory,
         save_fsdp_model,
         save_fsdp_optimizer,
@@ -3964,13 +3968,12 @@ class Trainer:
                         self.args.device if self.args.world_size > 1 and self.args.device.type != "cpu" else "cpu"
                     )
                     if self.is_fsdp_enabled:
-                        load_fsdp_optimizer(
+                        load_fsdp_optimizer_state(
                             self.accelerator.state.fsdp_plugin,
                             self.accelerator,
                             self.optimizer,
                             self.model,
                             checkpoint,
-                            **get_fsdp_ckpt_kwargs(),
                         )
                     else:
                         check_torch_load_is_safe()
